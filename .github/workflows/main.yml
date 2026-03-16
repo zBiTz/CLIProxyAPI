@@ -32,7 +32,28 @@ jobs:
         run: |
           git checkout main
           git pull origin main
-          git merge --no-edit upstream/main
+          BEFORE_MERGE=$(git rev-parse HEAD)
+          # Attempt merge; if it fails, resolve conflicts in .github/workflows/ in favor of ours.
+          if ! git merge --no-edit upstream/main; then
+            MERGE_EXIT_CODE=$?
+            echo "Merge failed with exit code ${MERGE_EXIT_CODE}, checking for workflow conflicts..."
+            if git diff --name-only --diff-filter=U | grep -q '^.github/workflows/'; then
+              echo "Resolving conflicts in .github/workflows/ in favor of fork (ours)..."
+              git checkout --ours .github/workflows/
+              git add .github/workflows/
+              git commit -m "Resolve .github/workflows/ merge conflicts in favor of fork"
+            else
+              echo "Merge conflicts are not limited to .github/workflows/; aborting."
+              exit "${MERGE_EXIT_CODE}"
+            fi
+          fi
+          # Restore our workflow files after merge: GITHUB_TOKEN cannot push
+          # .github/workflows/ changes, so we keep our own versions.
+          git checkout "${BEFORE_MERGE}" -- .github/workflows/
+          git add .github/workflows/
+          if ! git diff --cached --quiet; then
+            git commit -m "Restore workflow files after upstream sync"
+          fi
 
       - name: Push to fork
         run: |
