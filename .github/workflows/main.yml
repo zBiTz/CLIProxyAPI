@@ -38,7 +38,7 @@ jobs:
           # .github/workflows/ changes, so we keep our own versions.
           git checkout "${BEFORE_MERGE}" -- .github/workflows/
           if ! git diff --cached --quiet; then
-            git commit --amend --no-edit
+            git commit -m "Restore workflow files after upstream sync"
           fi
 
       - name: Push to fork
