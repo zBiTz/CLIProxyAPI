@@ -35,4 +35,9 @@ jobs:
           git merge --no-edit upstream/main
 
       - name: Push to fork
-        run: git push origin main
+        run: |
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
+            echo "Fork is already up to date with upstream. Nothing to push."
+          else
+            git push origin main
+          fi
