@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -358,16 +359,30 @@ func repeatedHomeAuthError() *Error {
 }
 
 type homeAuthDispatchResponse struct {
-	SelectionID   string                 `json:"selection_id,omitempty"`
-	Model         string                 `json:"model"`
-	Provider      string                 `json:"provider"`
-	AuthIndex     string                 `json:"auth_index"`
-	UserAPIKey    string                 `json:"user_api_key"`
-	RequestRetry  *int                   `json:"request_retry,omitempty"`
-	ForceMapping  bool                   `json:"force_mapping"`
-	OriginalAlias string                 `json:"original_alias"`
-	ModelInfo     *homeDispatchModelInfo `json:"model_info,omitempty"`
-	Auth          Auth                   `json:"auth"`
+	SelectionID    string                 `json:"selection_id,omitempty"`
+	Model          string                 `json:"model"`
+	Provider       string                 `json:"provider"`
+	ExecutorPlugin string                 `json:"executor_plugin,omitempty"`
+	AuthIndex      string                 `json:"auth_index"`
+	UserAPIKey     string                 `json:"user_api_key"`
+	RequestRetry   *int                   `json:"request_retry,omitempty"`
+	ForceMapping   bool                   `json:"force_mapping"`
+	OriginalAlias  string                 `json:"original_alias"`
+	ModelInfo      *homeDispatchModelInfo `json:"model_info,omitempty"`
+	Auth           Auth                   `json:"auth"`
+}
+
+// HomePluginExecutorResolver exposes the live plugin executors that accept Home credentials.
+type HomePluginExecutorResolver interface {
+	HomeExecutorPlugins() map[string][]string
+	ResolveHomePluginExecutor(pluginID, authProvider string) (ProviderExecutor, error)
+}
+
+// SetHomePluginExecutorResolver installs the plugin host for Home dispatch.
+func (m *Manager) SetHomePluginExecutorResolver(resolver HomePluginExecutorResolver) {
+	m.mu.Lock()
+	m.homePluginExecutors = resolver
+	m.mu.Unlock()
 }
 
 type homeDispatchModelInfo struct {
@@ -873,11 +888,18 @@ func (m *Manager) replaceHomeSelectionAuth(selection *HomeDispatchSelection, aut
 		return
 	}
 	for sessionID, owners := range m.homeRuntimeAuthOwners {
+		sessionAuths := m.homeRuntimeAuths[sessionID]
+		if sessionAuths == nil {
+			continue
+		}
 		for authID, owner := range owners {
-			if owner != selection || m.homeRuntimeAuths[sessionID] == nil {
+			if owner != selection {
 				continue
 			}
-			m.homeRuntimeAuths[sessionID][authID] = updated.Clone()
+			if existing, exists := sessionAuths[authID]; !exists || existing == nil {
+				continue
+			}
+			sessionAuths[authID] = updated.Clone()
 		}
 	}
 	m.mu.Unlock()
@@ -1116,6 +1138,17 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 		ExecutionSessionID: homeExecutionSessionIDFromMetadata(opts.Metadata),
 		RequestedModel:     stringMetadataValue(opts.Metadata, cliproxyexecutor.RequestedModelMetadataKey),
 	})
+	m.mu.RLock()
+	pluginExecutors := m.homePluginExecutors
+	m.mu.RUnlock()
+	var readyPlugins map[string][]string
+	if pluginExecutors != nil {
+		readyPlugins = pluginExecutors.HomeExecutorPlugins()
+	}
+	if readyPlugins == nil {
+		readyPlugins = make(map[string][]string)
+	}
+	ctx = home.WithExecutorPlugins(ctx, readyPlugins)
 	credentialPolicy := credentialPolicyFromContext(ctx)
 	var raw []byte
 	var errRPop error
@@ -1274,11 +1307,31 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 		auth.EnsureIndex()
 	}
 
-	executor, okExecutor := m.Executor(executorKey)
+	authExecutor, okExecutor := m.Executor(executorKey)
 	if !okExecutor && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["base_url"]) != "" {
-		executor, okExecutor = m.Executor("openai-compatibility")
+		authExecutor, okExecutor = m.Executor("openai-compatibility")
 	}
-	if !okExecutor {
+	executor := authExecutor
+	executorPlugin := strings.TrimSpace(dispatch.ExecutorPlugin)
+	if executorPlugin != "" {
+		if isAuthDisabled(&auth) || strings.TrimSpace(dispatch.Model) == "" {
+			endScope()
+			return nil, &Error{Code: "invalid_auth", Message: "home plugin dispatch requires an enabled auth and an upstream model", HTTPStatus: http.StatusBadGateway}
+		}
+		var errPlugin error
+		if pluginExecutors == nil {
+			errPlugin = fmt.Errorf("plugin executor %q is unavailable: plugin host is not configured", executorPlugin)
+		} else {
+			executor, errPlugin = pluginExecutors.ResolveHomePluginExecutor(executorPlugin, logicalProvider)
+			if errPlugin == nil && executor == nil {
+				errPlugin = fmt.Errorf("plugin executor %q is unavailable", executorPlugin)
+			}
+		}
+		if errPlugin != nil {
+			endScope()
+			return nil, &Error{Code: ErrorCodeHomeExecutorPluginUnavailable, Message: errPlugin.Error(), HTTPStatus: http.StatusServiceUnavailable}
+		}
+	} else if !okExecutor {
 		endScope()
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered", HTTPStatus: http.StatusBadGateway}
 	}
@@ -1303,6 +1356,8 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 		endScope()
 		return nil, &Error{Code: "home_unavailable", Message: "home execution registry unavailable", Retryable: true, HTTPStatus: http.StatusServiceUnavailable}
 	}
+	selection.ExecutorPlugin = executorPlugin
+	selection.authExecutor = authExecutor
 	selection.modelInfo = dispatch.ModelInfo.registryModelInfo()
 	if dispatch.ModelInfo != nil {
 		selection.configurationUpdateSupport = dispatch.ModelInfo.SupportConfigurationUpdate
@@ -1430,16 +1485,21 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 			continue
 		}
 		candidates = append(candidates, creditsCandidateEntry{
-			auth:     auth.Clone(),
-			executor: executor,
-			provider: providerKey,
+			auth:        auth.Clone(),
+			executor:    executor,
+			provider:    providerKey,
+			targetModel: targetModel,
 		})
 	}
 	m.mu.RUnlock()
 
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	var known []creditsCandidateEntry
 	var unknown []creditsCandidateEntry
 	for _, candidate := range candidates {
+		if !antigravityCreditsAllowsCandidateModel(ctx, candidate.auth, routeModel, candidate.targetModel, opts, cfg, now) {
+			continue
+		}
 		hint, okHint, errHint := GetAntigravityCreditsHintForAuthRequired(ctx, candidate.auth)
 		if errHint != nil {
 			return nil, antigravityCreditsKVUnavailableError(errHint)
@@ -1467,9 +1527,10 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 }
 
 type creditsCandidateEntry struct {
-	auth     *Auth
-	executor ProviderExecutor
-	provider string
+	auth        *Auth
+	executor    ProviderExecutor
+	provider    string
+	targetModel string
 }
 
 func hasAntigravityProvider(providers []string) bool {
@@ -1831,17 +1892,23 @@ func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, provider
 	}
 	switch status {
 	case http.StatusTooManyRequests:
-		return isAntigravityCreditsQuota429(lastErr, retryAfterFromError(lastErr))
+		retryAfter := retryAfterFromError(lastErr)
+		var cooldownErr *modelCooldownError
+		if errors.As(lastErr, &cooldownErr) && cooldownErr != nil {
+			// A modelCooldownError wrapped in trustedRetryAfterError exposes the live
+			// remaining cooldown rather than the original upstream retry hint; defer to
+			// any hint carried by the underlying cause so credits admission uses the
+			// stored upstream hint instead of mistaking final countdown minutes for a
+			// short transient rate limit.
+			retryAfter = retryAfterFromError(cooldownErr.Unwrap())
+		}
+		return isAntigravityCreditsQuota429(lastErr, retryAfter)
 	case http.StatusServiceUnavailable:
 		return isAntigravityCreditsCapacity503(lastErr)
 	case 0:
 		var authErr *Error
 		if errors.As(lastErr, &authErr) && authErr != nil {
 			return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable" || authErr.Code == "model_cooldown"
-		}
-		var cooldownErr *modelCooldownError
-		if errors.As(lastErr, &cooldownErr) {
-			return true
 		}
 		return false
 	default:
@@ -1907,7 +1974,11 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		return cliproxyexecutor.Response{}, false, nil
 	}
 	routeModel := req.Model
-	candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, opts)
+	candidateOpts := opts
+	if len(candidateOpts.OriginalRequest) == 0 && len(req.Payload) > 0 {
+		candidateOpts.OriginalRequest = req.Payload
+	}
+	candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, candidateOpts)
 	if errCandidates != nil {
 		return cliproxyexecutor.Response{}, false, errCandidates
 	}
@@ -2065,7 +2136,11 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		return nil, false, nil
 	}
 	routeModel := req.Model
-	candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, opts)
+	candidateOpts := opts
+	if len(candidateOpts.OriginalRequest) == 0 && len(req.Payload) > 0 {
+		candidateOpts.OriginalRequest = req.Payload
+	}
+	candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, candidateOpts)
 	if errCandidates != nil {
 		return nil, false, errCandidates
 	}
